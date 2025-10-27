@@ -140,6 +140,7 @@ class Go2_BackFlip(BaseTask):
         self.base_quat[:] = self.root_states[:, 3:7]
         self.base_lin_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel[:] = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.projected_gravity[:] = quat_rotate_inverse(self.base_quat, self.gravity_vec)
         self.base_euler_xyz = get_euler_xyz_tensor(self.base_quat)
         # self.ori_error=torch.abs(self.base_euler_xyz[:,2]-)
         # print(self.episode_length_buf.shape,self.commands.shape,self.command_frame.shape)
@@ -237,6 +238,7 @@ class Go2_BackFlip(BaseTask):
         self.episode_length_buf[env_ids] = 0
         self.max_ang_vel_y[env_ids]=0.0
         self.last_contacts[env_ids] = 0
+        self.feet_air_time[env_ids] = 0.
         self.not_pushed_up[env_ids] = True
         self.not_pushed_rotot[env_ids] =True
         self.command_frame=torch.randint(50,60,(self.num_envs,),device=self.device)
@@ -262,6 +264,7 @@ class Go2_BackFlip(BaseTask):
         self.base_euler_xyz = get_euler_xyz_tensor(self.base_quat)
         self.base_lin_vel[env_ids] = quat_rotate_inverse(self.base_quat[env_ids], self.root_states[env_ids, 7:10])
         self.base_ang_vel[env_ids] = quat_rotate_inverse(self.base_quat[env_ids], self.root_states[env_ids, 10:13])
+        self.projected_gravity[env_ids] = quat_rotate_inverse(self.base_quat[env_ids], self.gravity_vec[env_ids])
         #这里要把全局坐标系下的速度和角速度都转换到局部坐标系下，控制前进是控制向基座坐标系下的前进方向，而不是全局坐标系下的前进方向
         for i in range(self.obs_history.maxlen):
             self.obs_history[i][env_ids] *= 0
@@ -606,6 +609,7 @@ class Go2_BackFlip(BaseTask):
         self.max_ang_vel_y=torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
         self.contact_filt = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device, requires_grad=False)
+        self.feet_air_time = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.float, device=self.device, requires_grad=False)
         self.was_in_flight = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.has_jumped = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.ori_error = torch.zeros(self.num_envs,dtype=torch.float, device=self.device, requires_grad=False)
@@ -617,6 +621,7 @@ class Go2_BackFlip(BaseTask):
 
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
+        self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
 
         self.not_pushed_up = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
         self.not_pushed_rotot = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device, requires_grad=False)
@@ -879,70 +884,90 @@ class Go2_BackFlip(BaseTask):
             gymutil.draw_lines(sphere_geom_start, self.gym, self.viewer, self.envs[i], sphere_pose_start)
     #------------ reward functions----------------
 
-    # =============== 阶段奖励 ===============
-    def _reward_phase_crouch(self):
-        """蹲姿：靠近 lie_joint_pos，低高度，无晃动"""
-        mask = (self.phase == 0)          # 对应阶段
-        if not mask.any():
-            return torch.zeros_like(mask, dtype=torch.float)
-        q_err = torch.sum((self.dof_pos - self.lie_joint_pos)**2, dim=1)
-        h_err = (self.root_states[:, 2] - 0.25).abs()
-        ori   = self.base_euler_xyz[:, [0, 2]].abs().sum(dim=1)
-        rew   = torch.exp(-q_err/0.4) * torch.exp(-h_err/0.1) * torch.exp(-ori/0.4)
-        return rew * mask.float()
+    def _reward_tracking_lin_vel(self):
+        """Tracking of linear velocity commands (xy axes)."""
+        lin_vel_error = torch.sum(
+            torch.square(self.commands[:, :2] - self.base_lin_vel[:, :2]),
+            dim=1,
+        )
+        return torch.exp(-lin_vel_error / self.cfg.rewards.tracking_sigma)
 
-    def _reward_phase_takeoff(self):
-        """离地瞬间：给垂直速度 + 俯仰角速度正向奖励"""
-        mask = (self.phase == 1)          # 对应阶段
-        if not mask.any():
-            return torch.zeros_like(mask, dtype=torch.float)
-        lin_z  = torch.clamp(self.base_lin_vel[:, 2], min=0.)
-        ang_y  = torch.clamp(self.base_ang_vel[:, 1], min=0.)
-        return (lin_z*2. + ang_y*0.5) * mask.float()
+    def _reward_tracking_ang_vel(self):
+        """Tracking of angular velocity commands (yaw)."""
+        ang_vel_error = torch.square(
+            self.commands[:, 2] - self.base_ang_vel[:, 2]
+        )
+        return torch.exp(-ang_vel_error / self.cfg.rewards.tracking_sigma)
 
-    def _reward_phase_flip(self):
-        mask = (self.phase == 2)
-        if not mask.any():
-            return torch.zeros_like(mask, dtype=torch.float)
-
-        euler_y   = self.base_euler_xyz[:, 1]
-        # 相对于起跳时刻的净翻转量，归一化到 [-π,π]
-        flipped   = (euler_y - self.flip_angle_start + np.pi) % (2*np.pi) - np.pi
-        # 目标：绝对值越大越好（最大 π）
-        target_abs = np.pi
-        # 误差：离 π 越远越差
-        error = (flipped.abs() - target_abs).abs()
-        angle_rw = torch.exp(-error / 0.5)
-
-        vel_rw = torch.clamp(self.base_ang_vel[:, 1], min=0.2, max=15.)
-        return (angle_rw + 0.3*vel_rw/15.) * mask.float()
-
-    def _reward_phase_landing(self):
-        """落地 0.3 s 内：位置回原，姿态水平，角速度小"""
-        mask = (self.phase == 3) & (self.landing_timer < 0.3)
-        if not mask.any():
-            return torch.zeros_like(mask, dtype=torch.float)
-    
-        pos_err = (self.root_states[:, :2] - self.init_state[:, :2]).norm(dim=1)
-        ori_err = self.base_euler_xyz[:, [0, 2]].abs().sum(dim=1)
-        vel_err = self.base_ang_vel.norm(dim=1)
-        rew = torch.exp(-pos_err/0.2) * torch.exp(-ori_err/0.4) * torch.exp(-vel_err/5.)
-        return rew * mask.float()
-
-    # =============== 通用惩罚 ===============
-    def _reward_torques(self):
-        return torch.sum(self.torques.abs(), dim=1)
-
-    def _reward_action_rate(self):
-        return (self.actions - self.last_actions).norm(dim=1)
-
-    def _reward_collision(self):
-        return (self.contact_forces[:, self.penalised_contact_indices, :].norm(dim=-1) > 1.).sum(dim=1).float()
+    def _reward_lin_vel_z(self):
+        """Penalize z axis base linear velocity."""
+        return torch.square(self.base_lin_vel[:, 2])
 
     def _reward_ang_vel_xy(self):
-        return self.base_ang_vel[:, [0, 2]].abs().sum(dim=1)
+        """Penalize xy axes base angular velocity."""
+        return torch.sum(torch.square(self.base_ang_vel[:, :2]), dim=1)
+
+    def _reward_orientation(self):
+        """Penalize non flat base orientation."""
+        return torch.sum(torch.square(self.projected_gravity[:, :2]), dim=1)
+
+    def _reward_torques(self):
+        """Penalize torques."""
+        return torch.sum(torch.square(self.torques), dim=1)
+
+    def _reward_dof_vel(self):
+        """Penalize dof velocities."""
+        return torch.sum(torch.square(self.dof_vel), dim=1)
+
+    def _reward_dof_acc(self):
+        """Penalize dof accelerations."""
+        return torch.sum(
+            torch.square((self.last_dof_vel - self.dof_vel) / self.dt), dim=1
+        )
+
+    def _reward_action_rate(self):
+        """Penalize changes in actions."""
+        return torch.sum(torch.square(self.last_actions - self.actions), dim=1)
+
+    def _reward_base_height(self):
+        """Penalize base height away from target."""
+        base_height = self.root_states[:, 2]
+        return torch.square(base_height - self.cfg.rewards.base_height_target)
+
+    def _reward_collision(self):
+        """Penalize collisions on selected bodies."""
+        return torch.sum(
+            1.0
+            * (
+                torch.norm(
+                    self.contact_forces[:, self.penalised_contact_indices, :],
+                    dim=-1,
+                )
+                > 0.1
+            ),
+            dim=1,
+        )
+
+    def _reward_termination(self):
+        """Terminal reward / penalty."""
+        return self.reset_buf * ~self.time_out_buf
 
     def _reward_dof_pos_limits(self):
-        lower = (self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.)
-        upper = (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.)
-        return -(lower.sum(dim=1) + upper.sum(dim=1))
+        """Penalize dof positions too close to the limit."""
+        out_of_limits = -(self.dof_pos - self.dof_pos_limits[:, 0]).clip(max=0.0)
+        out_of_limits += (self.dof_pos - self.dof_pos_limits[:, 1]).clip(min=0.0)
+        return torch.sum(out_of_limits, dim=1)
+
+    def _reward_feet_air_time(self):
+        """Reward long steps by encouraging longer air time."""
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.0
+        contact_filt = torch.logical_or(contact, self.last_contacts)
+        self.last_contacts = contact
+        first_contact = (self.feet_air_time > 0.0) * contact_filt
+        self.feet_air_time += self.dt
+        rew_airTime = torch.sum(
+            (self.feet_air_time - 0.5) * first_contact, dim=1
+        )
+        rew_airTime *= torch.norm(self.commands[:, :2], dim=1) > 0.1
+        self.feet_air_time *= ~contact_filt
+        return rew_airTime

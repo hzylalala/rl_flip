@@ -159,23 +159,25 @@ class GO2_BackFlip_Cfg_Yu( LeggedRobotCfg ):
         push_towards_goal=True 
     class rewards:
         class scales:
-            # 阶段引导（ curriculum 可动态调权重 ）
-            phase_crouch        = 2.0   # 蹲姿
-            phase_takeoff       = 5.0   # 离地瞬间
-            phase_flip          = 15.0  # 翻转角度
-            phase_landing       = 10.0  # 落地姿态 & 位置
-            # 通用惩罚
-            torques              = -2e-4
-            action_rate         = -1e-2
-            collision           = -10.0
-            dof_pos_limits       = -10.0
-            ang_vel_xy          = -0.2
-            termination         = 0.0
+            tracking_lin_vel = 1.0
+            tracking_ang_vel = 0.5
+            lin_vel_z = -2.0
+            ang_vel_xy = -0.2
+            orientation = -2.0
+            torques = -2e-4
+            dof_vel = 0.0
+            dof_acc = -2.5e-7
+            base_height = -10.0
+            feet_air_time = 1.0
+            collision = -10.0
+            action_rate = -1e-2
+            dof_pos_limits = -10.0
+            termination = 0.0
 
         max_contact_force=150
         only_positive_rewards=False
-        reward_sigma=0.25
-        target_height=0.6
+        tracking_sigma=0.25
+        base_height_target=0.6
         soft_dof_pos_limit=0.9
     class normalization:
         class obs_scales:
